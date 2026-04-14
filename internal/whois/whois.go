@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/caarlos0/domain_exporter/internal/client"
+	rdapclient "github.com/caarlos0/domain_exporter/internal/rdap"
 	"github.com/domainr/whois"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/idna"
@@ -89,6 +90,9 @@ var (
 		`Registered:\t\t`,
 	}, "|") + `)\]?:?\s?(.*)`)
 	registrarRE = regexp.MustCompile(`(?i)Registrar WHOIS Server: (.*)`)
+	rdapFallbackExpireTime = func(ctx context.Context, domain string) (time.Time, error) {
+		return rdapclient.NewClient().ExpireTime(ctx, domain, "")
+	}
 )
 
 type whoisClient struct{}
@@ -102,11 +106,11 @@ func (c whoisClient) ExpireTime(ctx context.Context, domain string, host string)
 	log.Debug().Msgf("trying whois client for %q", domain)
 	body, err := c.request(ctx, domain, host)
 	if err != nil {
-		return time.Now(), err
+		return fallbackToRDAP(ctx, domain, host, err)
 	}
 	result := expiryRE.FindStringSubmatch(body)
-	if len(result) < 2 {
-		return time.Now(), fmt.Errorf("could not parse whois response: %q", body)
+	if len(result) < 3 {
+		return fallbackToRDAP(ctx, domain, host, fmt.Errorf("could not parse whois response: %q", body))
 	}
 	dateStr := strings.TrimSpace(result[2])
 	for _, format := range formats {
@@ -115,7 +119,22 @@ func (c whoisClient) ExpireTime(ctx context.Context, domain string, host string)
 			return date, nil
 		}
 	}
-	return time.Now(), fmt.Errorf("could not parse date: %q", dateStr)
+	return fallbackToRDAP(ctx, domain, host, fmt.Errorf("could not parse date: %q", dateStr))
+}
+
+func fallbackToRDAP(ctx context.Context, domain, host string, cause error) (time.Time, error) {
+	if host != "" {
+		return time.Now(), cause
+	}
+
+	log.Debug().Err(cause).Str("domain", domain).Msg("whois lookup failed, trying rdap fallback")
+	expiration, err := rdapFallbackExpireTime(ctx, domain)
+	if err == nil {
+		log.Debug().Str("domain", domain).Time("expires_at", expiration).Msg("resolved expiration via rdap fallback")
+		return expiration, nil
+	}
+
+	return time.Now(), fmt.Errorf("%w; rdap fallback failed: %w", cause, err)
 }
 
 func (c whoisClient) request(ctx context.Context, domain, host string) (string, error) {
