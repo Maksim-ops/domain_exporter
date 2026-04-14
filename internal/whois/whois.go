@@ -2,6 +2,7 @@ package whois
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -16,6 +17,11 @@ import (
 
 // nolint: gochecknoglobals
 var (
+	errWhoisExpiryNotFound = errors.New("whois expiry field not found")
+
+	whoisAttemptTimeout = 3 * time.Second
+	rdapAttemptTimeout  = 5 * time.Second
+
 	formats = []string{
 		time.ANSIC,
 		time.UnixDate,
@@ -64,7 +70,7 @@ var (
 	}
 
 	// nolint: lll
-	expiryRE = regexp.MustCompile(`(?i)(` + strings.Join([]string{
+	expiryRE = regexp.MustCompile(`(?im)^[[:space:]]*(` + strings.Join([]string{
 		"Registrar Registration Expiration Date",
 		"expire-date",
 		"Valid Until",
@@ -88,7 +94,7 @@ var (
 		"OK-UNTIL",
 		"registered",
 		`Registered:\t\t`,
-	}, "|") + `)\]?:?\s?(.*)`)
+	}, "|") + `)\]?:?[[:space:]]*(.*)$`)
 	registrarRE = regexp.MustCompile(`(?i)Registrar WHOIS Server: (.*)`)
 	rdapFallbackExpireTime = func(ctx context.Context, domain string) (time.Time, error) {
 		return rdapclient.NewClient().ExpireTime(ctx, domain, "")
@@ -110,7 +116,7 @@ func (c whoisClient) ExpireTime(ctx context.Context, domain string, host string)
 	}
 	result := expiryRE.FindStringSubmatch(body)
 	if len(result) < 3 {
-		return fallbackToRDAP(ctx, domain, host, fmt.Errorf("could not parse whois response: %q", body))
+		return fallbackToRDAP(ctx, domain, host, errWhoisExpiryNotFound)
 	}
 	dateStr := strings.TrimSpace(result[2])
 	for _, format := range formats {
@@ -127,8 +133,15 @@ func fallbackToRDAP(ctx context.Context, domain, host string, cause error) (time
 		return time.Now(), cause
 	}
 
-	log.Debug().Err(cause).Str("domain", domain).Msg("whois lookup failed, trying rdap fallback")
-	expiration, err := rdapFallbackExpireTime(ctx, domain)
+	if errors.Is(cause, errWhoisExpiryNotFound) {
+		log.Debug().Str("domain", domain).Msg("whois did not contain expiry, trying rdap fallback")
+	} else {
+		log.Debug().Err(cause).Str("domain", domain).Msg("whois lookup failed, trying rdap fallback")
+	}
+	rdapCtx, cancel := withAttemptTimeout(ctx, rdapAttemptTimeout)
+	defer cancel()
+
+	expiration, err := rdapFallbackExpireTime(rdapCtx, domain)
 	if err == nil {
 		log.Debug().Str("domain", domain).Time("expires_at", expiration).Msg("resolved expiration via rdap fallback")
 		return expiration, nil
@@ -152,7 +165,10 @@ func (c whoisClient) request(ctx context.Context, domain, host string) (string, 
 	if err := req.Prepare(); err != nil {
 		return "", fmt.Errorf("failed to prepare: %w", err)
 	}
-	resp, err := whois.DefaultClient.FetchContext(ctx, req)
+	reqCtx, cancel := withAttemptTimeout(ctx, whoisAttemptTimeout)
+	defer cancel()
+
+	resp, err := whois.DefaultClient.FetchContext(reqCtx, req)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch whois request: %w", err)
 	}
@@ -186,4 +202,19 @@ func (c whoisClient) request(ctx context.Context, domain, host string) (string, 
 
 	log.Debug().Msgf("ignoring error from %s for %s", foundHost, domain)
 	return body, nil
+}
+
+func withAttemptTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining < timeout {
+			timeout = remaining
+		}
+	}
+
+	if timeout <= 0 {
+		return context.WithCancel(ctx)
+	}
+
+	return context.WithTimeout(ctx, timeout)
 }
